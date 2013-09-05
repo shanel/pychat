@@ -1,128 +1,139 @@
 #!/usr/bin/env python
 
-import sys
-import os.path
-import posix
-import pwd
-import termios
+import collections
 import curses
 import curses.ascii
-import threading
-import Queue
-import select
-import socket
-import time
 import optparse
-import stat
+import os.path
 import platform
+import Queue
+import socket
+import stat
 import subprocess
+import sys
+import termios
+import threading
+import time
+import traceback
 
-class HistoryQueue(object):
-  def __init__(self):
-    self.list = []
-  def push(self,item):
-    self.list.insert(0,item)
+import posix
+import pwd
+import select
+
+
+class HistoryQueue(collections.deque):
+
+  def push(self, val):
+    self.append(val)
+
   def pop(self):
-    return self.list.pop()
-  def peek(self):
-    return self.list[-1]
-  def isEmpty(self):
-    return len(self.list) == 0
+    self.popleft()
 
-class Stack(object):
-  def __init__(self):
-    self.list = []
-  def push(self,item):
-    self.list.append(item)
-  def pop(self):
-    return self.list.pop()
   def peek(self):
-    return self.list[-1]
-  def isEmpty(self):
-    return len(self.list) == 0
+    return self[0]
 
-class History(object):
-  def __init__(self,limit,iterator=None):
+  def isEmpty(self):
+    return not bool(len(self))
+
+
+class Stack(list):
+
+  def push(self, val):
+    self.append(val)
+
+  def peek(self):
+    return self[-1]
+
+  def isEmpty(self):
+    return not bool(len(self))
+
+
+class History(list):
+
+  def __init__(self, limit, iterator=None):
     self.limit = limit
-    self.items = []
-    if iterator is not None:
+    if iterator:
       for val in iterator:
         self.record(val)
-  def __iter__(self):
-    for item in self.items:
-      yield item
-  def reversed(self):
-    for item in reversed(self.items):
-      yield item
-  def __getitem__(self,idx):
-    return self.items[idx]
-  def __len__(self):
-    return len(self.items)
-  def __getslice__(self,i,j):
-    return self.items[i:j]
+
   def clear(self):
-    self.items = []
+    for i in xrange(0, len(self)):
+      self.pop()
+
+  def record(self, obj):
+    raise NotImplemented
+
 
 class ReceivedHistory(History):
-  def record(self,obj):
-    self.items.append(obj)
-    if len(self.items) > self.limit:
-      self.items = self.items[1:]
+
+  def record(self, obj):
+    self.append(obj)
+    if len(self) > self.limit:
+      self.pop(0)
+
 
 class CommandHistory(History):
-  def record(self,obj):
-    self.items.insert(0,obj)
-    if len(self.items) > self.limit:
-      self.items = self.items[:-1]
 
-def protect(err=None,fin=None):
-  def wrap(f):
-    def wrapped_f(*args,**kwargs):
+  def record(self, obj):
+    self.insert(0, obj)
+    if len(self) > self.limit:
+      self.pop()
+
+
+def protect(err=None, fin=None):
+  def wrap(func):
+    def wrapped_func(*args, **kwargs):
       try:
-        return f(*args,**kwargs)
-      except BaseException, e:
-        if err is not None:
+        return func(*args, **kwargs)
+      except BaseException as e:
+        if err:
           return err(e)
       finally:
-        if fin is not None:
+        if fin:
           fin()
-    return wrapped_f
+    return wrapped_func
   return wrap
 
 class KeyEvent(object):
-  def __init__(self,ch):
+
+  def __init__(self, ch):
     assert type(ch) is int
     self.ch = ch
+
   def handle(self):
     s = handle_key(self.ch)
     if s is not None:
-      if len(s) == 0:
-        pass
-      elif s[0] == '/':
-        handle_command(s)
-      else:
-        if awayp():
-          do_back('')
-        send_to_all("<%s> %s" % (options.name,s))
+      if s:
+        if s[0] == '/':
+          handle_command(s)
+        else:
+          if awayp():
+            do_back('')
+          send_to_all("<%s> %s" % (options.name, s))
     refresh_input_window()
 
 class WinchEvent(object):
+
   def handle(self):
     regenerate_windows()
     refresh_input_window()
 
 class RecvEvent(object):
-  def __init__(self,s):
+
+  def __init__(self, s):
     self.s = s
+
   def handle(self):
     add_to_display(self.s)
     move_cursor_to_point()
     input_window.refresh()
 
 class InternalErrorEvent(object):
-  def __init__(self,public,private):
+
+  def __init__(self, public, private):
     self.public  = public
     self.private = private
+
   def handle(self):
     global error_msg
     do_quit(self.public)
@@ -130,40 +141,38 @@ class InternalErrorEvent(object):
     quitting = True
 
 parser = optparse.OptionParser()
-parser.add_option('-n','--name',dest="name",type="string",
+parser.add_option('-n', '--name', dest="name", type="string",
                   default=pwd.getpwuid(posix.getuid())[0],
                   help="use an alternate name")
-parser.add_option('-c','--chattype',dest="chattype",type="string",
+parser.add_option('-c', '--chattype', dest="chattype", type="string",
                   default=os.path.basename(sys.argv[0]),
                   help="Select chat type (electionchat, hoserchat, etc)")
-parser.add_option('-s','--spartan',dest="spartan",
-                  action="store_true",default=False,
+parser.add_option('-s', '--spartan', dest="spartan",
+                  action="store_true", default=False,
                   help="Spartan mode. Don't display timestamps, etc.")
 
-options,args = parser.parse_args()
-if len(args) != 0:
+options, args = parser.parse_args()
+if args:
   parser.error("Unable to parse all command line options")
 
 
 progname = os.path.basename(sys.argv[0])
 myhome   = pwd.getpwuid(posix.getuid()).pw_dir
-sockdir  = '/tmp/.'+options.chattype
-sockname = sockdir + '/'+options.name
+sockdir  = '/tmp/.' + options.chattype
+sockname = sockdir + '/' + options.name
 realname = pwd.getpwuid(posix.getuid()).pw_name
-awayfile = os.path.join(sockdir,'.%s.away'%realname)
+awayfile = os.path.join(sockdir, '.{0}.away'.format(realname))
 
 def debug(s):
-  return
-  pipename = myhome+'/.pychatdbg'
-  if not os.path.exists(pipename):
-    return
-  try:
-    pipe = open(pipename,'w')
-    if select.select([],[pipe],[],0)[1] is not []:
-      print >> pipe, s
-    pipe.close()
-  except IOError:
-    pass
+  return  # why is there anymore method here if we just return first?
+  pipename = myhome + '/.pychatdbg'
+  if os.path.exists(pipename):
+    try:
+      with open(pipename, 'w') as pipe:
+        if select.select([], [pipe], [], 0)[1]:
+          pipe.write(s)
+    except IOError:
+      pass
 
 stdscr = None
 input_window = None
@@ -172,34 +181,27 @@ status_bar = None
 screen_width  = 0
 need_window_regeneration = False
 
-buf           = ""
-point         = 0
-mark          = None
-kill_ring     = Stack()
+buf = ""
+point = 0
+mark = None
+kill_ring = Stack()
 display_index = 0
 
 received = ReceivedHistory(1000)
 
 command_history = CommandHistory(100)
-command_history_index = -1 # means not in the history
-saved_buf = "" # save buf while we scroll our history
+command_history_index = -1  # means not in the history
+saved_buf = ""  # save buf while we scroll our history
 
 events = Queue.Queue(-1)
 
 VDSUSP = None
-if platform.system() == 'Darwin':
-  #mac
+_POSIX_VDISABLE = '\xFF'
+system = platform.system()
+if system in ('Darwin', 'SunOS'):
   VDSUSP = 11
-  _POSIX_VDISABLE = '\xFF'
-elif platform.system() == 'SunOS':
-  VDSUSP = 11
+if system in ('SunOS', 'Linux'):
   _POSIX_VDISABLE = '\x00'
-elif platform.system() == 'Linux':
-  #no DSUSP
-  _POSIX_VDISABLE = '\x00'
-else:
-  #Guess
-  _POSIX_VDISABLE = '\xFF'
 
 quitting = False
 
@@ -208,15 +210,14 @@ ready_semaphore = threading.Semaphore(0)
 error_msg = None
 
 def record_err_and_quit(e):
-  import traceback
   global error_msg,quitting
-  err = "Thread %s raised an unhandled exception.\n" % threading.currentThread().name
+  err = "Thread {0} raised an unhandled exception.\n".format(threading.currentThread().name)
   err += traceback.format_exc()
   error_msg = err
   quitting = True
 
 def inform(s):
-  add_to_display('pychat: %s' % s)
+  add_to_display('pychat: {0}'.format(s))
 
 @protect(err=record_err_and_quit)
 def keyboard_read_loop():
